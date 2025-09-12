@@ -659,6 +659,14 @@ final class RootViewController: UIViewController, ObservableObject {
         
         watchManager?.updateWatchApp(forceComplicationUpdate: false)
         
+        // update the UI (chart + pump status) as soon as the app appears. We'll update it again in a couple of seconds
+        // in case more data arrives in the meantime (i.e. follower/NS data etc)
+        // we used to just wait two seconds, but some users thought that the app didn't work and then "caught up"
+        // so it makes more sense to just update immediately.
+        self.updateLabelsAndChart(overrideApplicationState: true)
+        
+        self.updatePumpAndAIDStatusViews()
+        
         // let's run the data source info and chart update 1 second after the root view appears. This should give time for the follower modes to download and populate the info needed.
         // no animation is needed as in most cases, we're just refreshing and displaying what is already shown on screen so we want to keep this refresh invisible.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
@@ -691,7 +699,6 @@ final class RootViewController: UIViewController, ObservableObject {
         // set up the clock view
         clockDateFormatter.dateStyle = .none
         clockDateFormatter.timeStyle = .short
-        clockDateFormatter.dateFormat = "HH:mm"
         clockLabelOutlet.font = ConstantsUI.clockLabelFontSize
         clockLabelOutlet.textColor = ConstantsUI.clockLabelColor
                 
@@ -1535,9 +1542,6 @@ final class RootViewController: UIViewController, ObservableObject {
                     // update data source info
                     updateDataSourceInfo()
                     
-                    // try and reload the widget timeline(s)
-                    WidgetCenter.shared.reloadAllTimelines()
-                    
                 }
                 
                 nightscoutSyncManager?.uploadLatestBgReadings(lastConnectionStatusChangeTimeStamp: lastConnectionStatusChangeTimeStamp())
@@ -1600,7 +1604,7 @@ final class RootViewController: UIViewController, ObservableObject {
             // redraw chart is necessary
             if let glucoseChartManager = glucoseChartManager {
                 
-                glucoseChartManager.updateChartPoints(endDate: glucoseChartManager.endDate, startDate: glucoseChartManager.endDate.addingTimeInterval(.hours(-UserDefaults.standard.chartWidthInHours)), chartOutlet: chartOutlet, completionHandler: nil)
+                glucoseChartManager.updateChartPoints(endDate: glucoseChartManager.endDate, startDate: glucoseChartManager.endDate.addingTimeInterval(.hours(-UserDefaults.standard.chartWidthInHours)), chartOutlet: chartOutlet, forceReset: false, completionHandler: nil)
                 
             }
             
@@ -1865,9 +1869,11 @@ final class RootViewController: UIViewController, ObservableObject {
     }
     
     /// will update the chart with endDate = currentDate
-    private func updateChartWithResetEndDate() {
+    /// - parameters:
+    ///     - forceReset : if true, then we'll force a rescale of the chart y-axis
+    private func updateChartWithResetEndDate(forceReset: Bool = false) {
         
-        glucoseChartManager?.updateChartPoints(endDate: Date(), startDate: nil, chartOutlet: chartOutlet, completionHandler: nil)
+        glucoseChartManager?.updateChartPoints(endDate: Date(), startDate: nil, chartOutlet: chartOutlet, forceReset: forceReset, completionHandler: nil)
         
     }
     
@@ -1907,7 +1913,14 @@ final class RootViewController: UIViewController, ObservableObject {
         updateLabelsAndChartTimer = createAndScheduleUpdateLabelsAndChartTimer()
         
         // updateLabelsAndChartTimer needs to be created when app comes back from background to foreground
-        ApplicationManager.shared.addClosureToRunWhenAppWillEnterForeground(key: applicationManagerKeyCreateupdateLabelsAndChartTimer, closure: {updateLabelsAndChartTimer = createAndScheduleUpdateLabelsAndChartTimer()})
+        ApplicationManager.shared.addClosureToRunWhenAppWillEnterForeground(key: applicationManagerKeyCreateupdateLabelsAndChartTimer, closure: {
+            
+            updateLabelsAndChartTimer = createAndScheduleUpdateLabelsAndChartTimer()
+            
+            // reset the chart when coming to the foreground if the user has selected that option
+            // if they hadn't selected, then just refresh anyway because it seems to prevent the "empty chart" that sometimes happens
+            self.updateLabelsAndChart(overrideApplicationState: true, forceReset: UserDefaults.standard.allowMainChartAutoReset)
+        })
         
         // when app goes to background
         ApplicationManager.shared.addClosureToRunWhenAppDidEnterBackground(key: applicationManagerKeyInvalidateupdateLabelsAndChartTimerAndCloseSnoozeViewController, closure: {
@@ -2299,6 +2312,12 @@ final class RootViewController: UIViewController, ObservableObject {
         
     }
     
+    // need to add this as an objc helper function as we can't pass the needed parameters when calling the main function from a timer
+    // MAYBE DELETE
+    @objc private func updateLabelsAndChartWithReset() {
+        updateLabelsAndChart(forceReset: UserDefaults.standard.allowMainChartAutoReset)
+    }
+    
     /// - updates the labels and the chart,
     ///    - also in the landscapeValueViewController, if it exists.
     /// - but only if the chart is not panned backward
@@ -2306,7 +2325,7 @@ final class RootViewController: UIViewController, ObservableObject {
     /// - and if overrideApplicationState = false
     /// - parameters:
     ///     - overrideApplicationState : if true, then update will be done even if state is not .active
-    ///     - forceReset : if true, then force the update to be done even if the main chart is panned back in time (used for the double tap gesture)
+    ///     - forceReset : if true, then force the update to be done even if the main chart is panned back in time (used for the double tap gesture). This will also rescale the chart y-axis.
     @objc private func updateLabelsAndChart(overrideApplicationState: Bool = false, forceReset: Bool = false) {
         
         setNightscoutSyncRequiredToTrue(forceNow: false)
@@ -2442,7 +2461,8 @@ final class RootViewController: UIViewController, ObservableObject {
         diffLabelUnitOutlet.text = diffLabelUnitText
         
         // update the chart up to now
-        updateChartWithResetEndDate()
+        // if we're reacting to a double tap, then also rescale the chart y-axis to the current values
+        updateChartWithResetEndDate(forceReset: forceReset)
         
         self.updateMiniChart()
         
@@ -2733,11 +2753,13 @@ final class RootViewController: UIViewController, ObservableObject {
         // don't calculate statis if app is not running in the foreground
         guard UIApplication.shared.applicationState == .active || overrideApplicationState else {return}
         
-        // show (or even hide) the view if required
-        statisticsView.isHidden = !UserDefaults.standard.showStatistics
-        
-        // show/hide the selector as needed
-        segmentedControlStatisticsDaysView.isHidden = !UserDefaults.standard.showStatistics
+        if !screenIsLocked {
+            // show (or even hide) the view if required
+            statisticsView.isHidden = !UserDefaults.standard.showStatistics
+            
+            // show/hide the selector as needed
+            segmentedControlStatisticsDaysView.isHidden = !UserDefaults.standard.showStatistics
+        }
         
         // if the user doesn't want to see the statistics, then just return without doing anything
         if !UserDefaults.standard.showStatistics {
@@ -3612,7 +3634,7 @@ final class RootViewController: UIViewController, ObservableObject {
                 var deviceStatusCreatedAt: Date?
                 var deviceStatusLastLoopDate: Date?
                 
-                if let deviceStatus = nightscoutSyncManager?.deviceStatus as? NightscoutDeviceStatus, UserDefaults.standard.nightscoutFollowType != .none, deviceStatus.createdAt != .distantPast {
+                if let deviceStatus = nightscoutSyncManager?.deviceStatus as? NightscoutDeviceStatus, UserDefaults.standard.nightscoutEnabled, UserDefaults.standard.nightscoutFollowType != .none, deviceStatus.createdAt != .distantPast {
                     deviceStatusCreatedAt = deviceStatus.createdAt
                     deviceStatusLastLoopDate = deviceStatus.lastLoopDate
                 }
@@ -3996,7 +4018,7 @@ extension RootViewController: UNUserNotificationCenterDelegate {
             // this will verify if it concerns an alert notification, if not pickerviewData will be nil
         } else if let pickerViewData = alertManager?.userNotificationCenter(center, willPresent: notification, withCompletionHandler: completionHandler) {
             
-            PickerViewController.displayPickerViewController(pickerViewData: pickerViewData, parentController: self)
+            PickerViewControllerModal.displayPickerViewController(pickerViewData: pickerViewData, parentController: self)
             
         }  else if notification.request.identifier == ConstantsNotifications.notificationIdentifierForVolumeTest {
             
@@ -4044,7 +4066,7 @@ extension RootViewController: UNUserNotificationCenterDelegate {
             if let pickerViewData = alertManager?.userNotificationCenter(center, didReceive: response) {
                 
                 trace("     userNotificationCenter didReceive, user pressed an alert notification to open the app", log: log, category: ConstantsLog.categoryRootView, type: .info)
-                PickerViewController.displayPickerViewController(pickerViewData: pickerViewData, parentController: self)
+                PickerViewControllerModal.displayPickerViewController(pickerViewData: pickerViewData, parentController: self)
                 
             } else {
                 // it as also not an alert notification that the user clicked, there might come in other types of notifications in the future
